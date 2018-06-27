@@ -1,5 +1,4 @@
-#define _XOPEN_SOURCE 700
-#define _POSIX_C_SOURCE 199309L
+#define _GNU_SOURCE
 #include <libavformat/avformat.h>
 #include <libavutil/display.h>
 #include <libavutil/hwcontext_drm.h>
@@ -7,38 +6,29 @@
 #include <libswresample/swresample.h>
 #include <libavutil/opt.h>
 #include <libavutil/time.h>
-#include <pulse/pulseaudio.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <pthread.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+#include "frame_fifo.h"
+#include "src_common.h"
 #include <libdrm/drm_fourcc.h>
 #include "wlr-export-dmabuf-unstable-v1-client-protocol.h"
 
 struct wayland_output {
-	struct wl_list link;
-	uint32_t id;
-	struct wl_output *output;
-	char *make;
-	char *model;
-	int width;
-	int height;
-	AVRational framerate;
+    struct wl_list link;
+    uint32_t id;
+    struct wl_output *output;
+    char *make;
+    char *model;
+    int width;
+    int height;
+    AVRational framerate;
 };
-
-typedef struct AVFrameFIFO {
-	AVFrame **queued_frames;
-	int num_queued_frames;
-	int max_queued_frames;
-	pthread_mutex_t lock;
-	pthread_cond_t cond;
-	pthread_mutex_t cond_lock;
-} AVFrameFIFO;
 
 struct capture_context {
     AVClass *class; /* For pretty logging */
@@ -77,15 +67,12 @@ struct capture_context {
     AVBufferRef *mapped_frames_ref;
 
     /* Audio */
+    void *audio_cap_ctx;
     int audio_streamid;
-    pa_sample_spec pa_spec;
     pthread_t audio_thread;
     int64_t audio_start_pts;
     AVCodecContext *audio_avctx;
     SwrContext *swr_ctx;
-    pa_context *pa_context;
-    pa_threaded_mainloop *pa_mainloop;
-    pa_mainloop_api *pa_mainloop_api;
     AVRational audio_src_tb;
     AVRational audio_dst_tb;
     AVFrameFIFO audio_frames;
@@ -110,75 +97,6 @@ struct capture_context {
     int audio_frame_queue;
     AVDictionary *audio_encoder_opts;
 };
-
-static int init_fifo(AVFrameFIFO *buf, int max_queued_frames)
-{
-    pthread_mutex_init(&buf->lock, NULL);
-    pthread_cond_init(&buf->cond, NULL);
-    pthread_mutex_init(&buf->cond_lock, NULL);
-    buf->num_queued_frames = 0;
-    buf->max_queued_frames = max_queued_frames;
-    buf->queued_frames = av_mallocz(buf->max_queued_frames * sizeof(AVFrame *));
-    return !buf->queued_frames ? AVERROR(ENOMEM) : 0;
-}
-
-static int get_fifo_size(AVFrameFIFO *buf)
-{
-    pthread_mutex_lock(&buf->lock);
-    int ret = buf->num_queued_frames;
-    pthread_mutex_unlock(&buf->lock);
-    return ret;
-}
-
-static int push_to_fifo(AVFrameFIFO *buf, AVFrame *f)
-{
-	int ret;
-    pthread_mutex_lock(&buf->lock);
-    if ((buf->num_queued_frames + 1) > buf->max_queued_frames) {
-        av_frame_free(&f);
-        ret = 1;
-    } else {
-        buf->queued_frames[buf->num_queued_frames++] = f;
-        ret = 0;
-    }
-    pthread_mutex_unlock(&buf->lock);
-    pthread_cond_signal(&buf->cond);
-    return ret;
-}
-
-static AVFrame *pop_from_fifo(AVFrameFIFO *buf)
-{
-    pthread_mutex_lock(&buf->lock);
-
-    if (!buf->num_queued_frames) {
-        pthread_mutex_unlock(&buf->lock);
-        pthread_mutex_lock(&buf->cond_lock);
-        pthread_cond_wait(&buf->cond, &buf->cond_lock);
-        pthread_mutex_unlock(&buf->cond_lock);
-        pthread_mutex_lock(&buf->lock);
-    }
-
-    int i;
-    AVFrame *rf = buf->queued_frames[0];
-    for (i = 1; i < buf->num_queued_frames; i++)
-        buf->queued_frames[i - 1] = buf->queued_frames[i];
-    buf->queued_frames[i - 1] = NULL;
-
-    buf->num_queued_frames--;
-
-    pthread_mutex_unlock(&buf->lock);
-    return rf;
-}
-
-static void free_fifo(AVFrameFIFO *buf)
-{
-    pthread_mutex_lock(&buf->lock);
-    if (buf->num_queued_frames)
-        for (int i = 0; i < buf->num_queued_frames; i++)
-            av_frame_free(&buf->queued_frames[i]);
-    av_freep(&buf->queued_frames);
-    pthread_mutex_unlock(&buf->lock);
-}
 
 static void output_handle_geometry(void *data, struct wl_output *wl_output,
                                    int32_t x, int32_t y, int32_t phys_width,
@@ -205,13 +123,13 @@ static void output_handle_mode(void *data, struct wl_output *wl_output,
 
 static void output_handle_done(void *data, struct wl_output *wl_output)
 {
-	/* Nothing to do */
+    /* Nothing to do */
 }
 
 static void output_handle_scale(void *data, struct wl_output *wl_output,
                                 int32_t factor)
 {
-	/* Nothing to do */
+    /* Nothing to do */
 }
 
 static const struct wl_output_listener output_listener = {
@@ -254,11 +172,11 @@ static void remove_output(struct wayland_output *out)
 static struct wayland_output *find_output(struct capture_context *ctx,
                                           struct wl_output *out, uint32_t id)
 {
-	struct wayland_output *output, *tmp;
-	wl_list_for_each_safe(output, tmp, &ctx->output_list, link)
-		if ((output->output == out) || (output->id == id))
-			return output;
-	return NULL;
+    struct wayland_output *output, *tmp;
+    wl_list_for_each_safe(output, tmp, &ctx->output_list, link)
+        if ((output->output == out) || (output->id == id))
+            return output;
+    return NULL;
 }
 
 static void registry_handle_remove(void *data, struct wl_registry *reg,
@@ -268,8 +186,8 @@ static void registry_handle_remove(void *data, struct wl_registry *reg,
 }
 
 static const struct wl_registry_listener registry_listener = {
-	.global = registry_handle_add,
-	.global_remove = registry_handle_remove,
+    .global = registry_handle_add,
+    .global_remove = registry_handle_remove,
 };
 
 static void frame_free(void *opaque, uint8_t *data)
@@ -293,47 +211,47 @@ static void frame_start(void *data, struct zwlr_export_dmabuf_frame_v1 *frame,
     struct capture_context *ctx = data;
     int err = 0;
 
-	/* Allocate DRM specific struct */
-	AVDRMFrameDescriptor *desc = av_mallocz(sizeof(*desc));
-	if (!desc) {
-		err = AVERROR(ENOMEM);
-		goto fail;
-	}
+    /* Allocate DRM specific struct */
+    AVDRMFrameDescriptor *desc = av_mallocz(sizeof(*desc));
+    if (!desc) {
+        err = AVERROR(ENOMEM);
+        goto fail;
+    }
 
-	desc->nb_objects = num_objects;
-	desc->objects[0].format_modifier = ((uint64_t)mod_high << 32) | mod_low;
+    desc->nb_objects = num_objects;
+    desc->objects[0].format_modifier = ((uint64_t)mod_high << 32) | mod_low;
 
-	desc->nb_layers = 1;
-	desc->layers[0].format = format;
+    desc->nb_layers = 1;
+    desc->layers[0].format = format;
 
-	/* Allocate a frame */
-	AVFrame *f = av_frame_alloc();
-	if (!f) {
-		err = AVERROR(ENOMEM);
-		goto fail;
-	}
+    /* Allocate a frame */
+    AVFrame *f = av_frame_alloc();
+    if (!f) {
+        err = AVERROR(ENOMEM);
+        goto fail;
+    }
 
-	/* Set base frame properties */
-	ctx->current_frame = f;
-	f->width = width;
-	f->height = height;
-	f->format = AV_PIX_FMT_DRM_PRIME;
+    /* Set base frame properties */
+    ctx->current_frame = f;
+    f->width = width;
+    f->height = height;
+    f->format = AV_PIX_FMT_DRM_PRIME;
 
-	/* Set the frame data to the DRM specific struct */
-	f->buf[0] = av_buffer_create((uint8_t*)desc, sizeof(*desc),
-			&frame_free, frame, 0);
-	if (!f->buf[0]) {
-		err = AVERROR(ENOMEM);
-		goto fail;
-	}
+    /* Set the frame data to the DRM specific struct */
+    f->buf[0] = av_buffer_create((uint8_t*)desc, sizeof(*desc),
+                                 &frame_free, frame, 0);
+    if (!f->buf[0]) {
+        err = AVERROR(ENOMEM);
+        goto fail;
+    }
 
-	f->data[0] = (uint8_t*)desc;
+    f->data[0] = (uint8_t*)desc;
 
-	return;
+    return;
 
 fail:
-	ctx->err = err;
-	frame_free(frame, (uint8_t *)desc);
+    ctx->err = err;
+    frame_free(frame, (uint8_t *)desc);
 }
 
 static void frame_object(void *data, struct zwlr_export_dmabuf_frame_v1 *frame,
@@ -552,22 +470,22 @@ void *video_encode_thread(void *arg)
 						av_err2str(ret));
 				err = ret;
 				goto end;
-			}
+            }
 
-			pkt.stream_index = ctx->video_streamid;
+            pkt.stream_index = ctx->video_streamid;
 
-			pthread_mutex_lock(&ctx->avf_lock);
-			err = av_interleaved_write_frame(ctx->avf, &pkt);
-			pthread_mutex_unlock(&ctx->avf_lock);
+            pthread_mutex_lock(&ctx->avf_lock);
+            err = av_interleaved_write_frame(ctx->avf, &pkt);
+            pthread_mutex_unlock(&ctx->avf_lock);
 
-			av_packet_unref(&pkt);
+            av_packet_unref(&pkt);
 
-			if (err) {
-				av_log(ctx, AV_LOG_ERROR, "Writing video packet fail: %s!\n",
-						av_err2str(err));
-				goto end;
-			}
-		};
+            if (err) {
+                av_log(ctx, AV_LOG_ERROR, "Writing video packet fail: %s!\n",
+                       av_err2str(err));
+                goto end;
+            }
+        };
 
 		av_log(ctx, AV_LOG_INFO, "Encoded video frame %i (%i in queue)\n",
 				ctx->video_avctx->frame_number, get_fifo_size(&ctx->video_frames));
@@ -575,36 +493,37 @@ void *video_encode_thread(void *arg)
 	} while (!ctx->err);
 
 end:
-	if (!ctx->err && err)
-		ctx->err = err;
-	return NULL;
+    if (!ctx->err && err)
+        ctx->err = err;
+    return NULL;
 }
 
 static int init_lavu_hwcontext(struct capture_context *ctx)
 {
-	/* DRM hwcontext */
-	ctx->drm_device_ref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_DRM);
-	if (!ctx->drm_device_ref)
-		return AVERROR(ENOMEM);
+    /* DRM hwcontext */
+    ctx->drm_device_ref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_DRM);
+    if (!ctx->drm_device_ref)
+        return AVERROR(ENOMEM);
 
-	AVHWDeviceContext *ref_data = (AVHWDeviceContext*)ctx->drm_device_ref->data;
-	AVDRMDeviceContext *hwctx = ref_data->hwctx;
+    AVHWDeviceContext *ref_data = (AVHWDeviceContext*)ctx->drm_device_ref->data;
+    AVDRMDeviceContext *hwctx = ref_data->hwctx;
 
-	/* We don't need a device (we don't even know it and can't open it) */
-	hwctx->fd = -1;
+    /* We don't need a device (we don't even know it and can't open it) */
+    hwctx->fd = -1;
 
-	av_hwdevice_ctx_init(ctx->drm_device_ref);
+    av_hwdevice_ctx_init(ctx->drm_device_ref);
 
-	/* Mapped hwcontext */
-	int err = av_hwdevice_ctx_create(&ctx->mapped_device_ref,
-			ctx->hw_device_type, ctx->hardware_device, NULL, 0);
-	if (err < 0) {
-		av_log(ctx, AV_LOG_ERROR, "Failed to create a hardware device: %s\n",
-				av_err2str(err));
-		return err;
-	}
+    /* Mapped hwcontext */
+    int err = av_hwdevice_ctx_create(&ctx->mapped_device_ref,
+                                     ctx->hw_device_type, ctx->hardware_device,
+                                     NULL, 0);
+    if (err) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to create a hardware device: %s\n",
+               av_err2str(err));
+        return err;
+    }
 
-	return 0;
+    return 0;
 }
 
 static int set_hwframe_ctx(struct capture_context *ctx,
@@ -836,25 +755,20 @@ static int init_encoding(struct capture_context *ctx) {
 	return err;
 }
 
-static int64_t conv_audio_pts(struct capture_context *ctx, int64_t in_pts)
+static int64_t conv_audio_pts(struct capture_context *ctx, int64_t in)
 {
-    int64_t b, c, res = INT64_MIN;
-    int64_t com_tb_num = 1;
-    int64_t com_tb_den = (int64_t)ctx->audio_src_samplerate * ctx->audio_dst_samplerate;
+    int64_t d = (int64_t)ctx->audio_src_samplerate * ctx->audio_dst_samplerate;
+    int64_t b = ctx->audio_src_tb.num * d;
+    int64_t c = ctx->audio_dst_tb.num * d;
 
-    b = ctx->audio_src_tb.num * com_tb_den;
-    c = com_tb_num * ctx->audio_src_tb.den;
-
-    res = av_rescale_rnd(in_pts, b, c, AV_ROUND_NEAR_INF);
+    /* Convert from audio_src_tb to 1/(src_samplerate * dst_samplerate) */
+    in = av_rescale_rnd(in, b, ctx->audio_src_tb.den, AV_ROUND_NEAR_INF);
 
     /* In units of 1/(src_samplerate * dst_samplerate) */
-    res = swr_next_pts(ctx->swr_ctx, res);
+    in = swr_next_pts(ctx->swr_ctx, in);
 
     /* Convert from 1/(src_samplerate * dst_samplerate) to audio_dst_tb */
-    b = com_tb_num * ctx->audio_dst_tb.den;
-    c = ctx->audio_dst_tb.num * com_tb_den;
-
-    return av_rescale_rnd(res, b, c, AV_ROUND_NEAR_INF);
+    return av_rescale_rnd(in, ctx->audio_dst_tb.den, c, AV_ROUND_NEAR_INF);
 }
 
 void *audio_encode_thread(void *arg)
@@ -869,11 +783,10 @@ void *audio_encode_thread(void *arg)
         if (!(os > ctx->audio_avctx->frame_size) &&
             (get_fifo_size(&ctx->audio_frames) || !atomic_load(&ctx->quit))) {
             in_f = pop_from_fifo(&ctx->audio_frames);
-            if (first_pts == INT64_MIN)
+            if (!frames_consumed++)
                 first_pts = in_f->pts;
-            frames_consumed++;
             os = swr_get_out_samples(ctx->swr_ctx, in_f->nb_samples);
-            if ((os < ctx->audio_avctx->frame_size) && !atomic_load(&ctx->quit)) {
+            if (os < ctx->audio_avctx->frame_size) {
                 swr_convert_frame(ctx->swr_ctx, NULL, in_f);
                 av_frame_free(&in_f);
                 continue;
@@ -957,176 +870,6 @@ end:
     return NULL;
 }
 
-static void pulse_stream_read_cb(pa_stream *stream, size_t size,
-                                 void *data)
-{
-    struct capture_context *ctx = data;
-
-    const void *buffer;
-    pa_stream_peek(stream, &buffer, &size);
-
-    AVFrame *f = av_frame_alloc();
-    f->sample_rate    = ctx->audio_src_samplerate;
-    f->format         = AV_SAMPLE_FMT_FLT;
-    f->channel_layout = AV_CH_LAYOUT_STEREO;
-    f->nb_samples     = size >> 3;
-
-    /* I can't believe these bastards don't output aligned data. Let's hope the
-     * ability to have writeable refcounted frames is worth it elsewhere. */
-    av_frame_get_buffer(f, 0);
-    memcpy(f->data[0], buffer, size);
-
-    int delay_neg;
-    pa_usec_t pts, delay;
-    pa_stream_get_time(stream, &pts);
-    pa_stream_get_latency(stream, &delay, &delay_neg);
-
-    f->pts = pts;
-    f->pts -= delay_neg ? -delay : delay;
-
-    pa_stream_drop(stream);
-
-    if (push_to_fifo(&ctx->audio_frames, f))
-        av_log(ctx, AV_LOG_WARNING, "Dropped audio frame!\n");
-
-    if (atomic_load(&ctx->quit) || ctx->err)
-        pa_stream_disconnect(stream);
-}
-
-static void pulse_stream_status_cb(pa_stream *stream, void *data)
-{
-    struct capture_context *ctx = data;
-    switch (pa_stream_get_state(stream)) {
-    case PA_STREAM_UNCONNECTED:
-        av_log(ctx, AV_LOG_INFO, "PulseAudio stream currently unconnected!\n");
-        break;
-    case PA_STREAM_CREATING:
-        av_log(ctx, AV_LOG_INFO, "PulseAudio stream being created!\n");
-        break;
-    case PA_STREAM_READY:
-        av_log(ctx, AV_LOG_INFO, "PulseAudio stream now ready!\n");
-        break;
-    case PA_STREAM_FAILED:
-        av_log(ctx, AV_LOG_INFO, "PulseAudio stream connection failed!\n");
-        break;
-    case PA_STREAM_TERMINATED:
-        av_log(ctx, AV_LOG_INFO, "PulseAudio stream terminated!\n");
-        wl_display_roundtrip(ctx->display);
-        pa_context_disconnect(ctx->pa_context);
-        break;
-    }
-}
-
-static void pulse_stream_buffer_attr_cb(pa_stream *s, void *data)
-{
-    const struct pa_buffer_attr *att = pa_stream_get_buffer_attr(s);
-    av_log(data, AV_LOG_WARNING, "Using buffer pa buffer attrs: "
-           "fragsize=%i, maxlen=%i\n", att->fragsize, att->maxlength);
-}
-
-static void pulse_stream_overflow_cb(pa_stream *stream, void *data)
-{
-    av_log(data, AV_LOG_ERROR, "PulseAudio stream overflowed!\n");
-}
-
-static void pulse_stream_underflow_cb(pa_stream *stream, void *data)
-{
-    av_log(data, AV_LOG_ERROR, "PulseAudio stream underflowed!\n");
-}
-
-static void pulse_sink_info_cb(pa_context *context, const pa_sink_info *info,
-                               int is_last, void *data)
-{
-    struct capture_context *ctx = data;
-
-    if (is_last)
-        return;
-
-    av_log(ctx, AV_LOG_INFO, "Starting capturing from \"%s\"\n",
-           info->description);
-
-    pa_stream *stream;
-    pa_buffer_attr attr = { 0 };
-    pa_channel_map map  = { 0 };
-
-    ctx->pa_spec.format   = PA_SAMPLE_FLOAT32LE;
-    ctx->pa_spec.rate     = ctx->audio_src_samplerate;
-    ctx->pa_spec.channels = 2;
-    pa_channel_map_init_stereo(&map);
-
-    attr.maxlength = -1;
-    attr.fragsize  = -1;
-
-    stream = pa_stream_new(context, "dmabuf-capture", &ctx->pa_spec, &map);
-
-    /* Set stream callbacks */
-    pa_stream_set_state_callback(stream, pulse_stream_status_cb, ctx);
-    pa_stream_set_read_callback(stream, pulse_stream_read_cb, ctx);
-    pa_stream_set_underflow_callback(stream, pulse_stream_underflow_cb, ctx);
-    pa_stream_set_overflow_callback(stream, pulse_stream_overflow_cb, ctx);
-    pa_stream_set_buffer_attr_callback(stream, pulse_stream_buffer_attr_cb, ctx);
-
-    /* Start stream */
-    pa_stream_connect_record(stream, info->monitor_source_name, &attr,
-                             PA_STREAM_ADJUST_LATENCY |
-                             PA_STREAM_AUTO_TIMING_UPDATE |
-                             PA_STREAM_INTERPOLATE_TIMING);
-}
-
-static void pulse_server_info_cb(pa_context *context, const pa_server_info *info,
-                                 void *data)
-{
-    struct capture_context *ctx = data;
-
-    pa_operation *op;
-    op = pa_context_get_sink_info_by_name(context, info->default_sink_name,
-                                          pulse_sink_info_cb, ctx);
-    pa_operation_unref(op);
-}
-
-static void pulse_state_cb(pa_context *context, void *data)
-{
-    struct capture_context *ctx = data;
-
-    switch (pa_context_get_state(context)) {
-    case PA_CONTEXT_UNCONNECTED:
-        av_log(ctx, AV_LOG_INFO, "PulseAudio reports it is unconnected!\n");
-        break;
-    case PA_CONTEXT_CONNECTING:
-        av_log(ctx, AV_LOG_INFO, "Connecting to PulseAudio!\n");
-        break;
-    case PA_CONTEXT_AUTHORIZING:
-        av_log(ctx, AV_LOG_INFO, "Authorizing PulseAudio connection!\n");
-        break;
-    case PA_CONTEXT_SETTING_NAME:
-        av_log(ctx, AV_LOG_INFO, "Sending client name!\n");
-        break;
-    case PA_CONTEXT_FAILED:
-        av_log(ctx, AV_LOG_INFO, "PulseAudio connection failed!\n");
-        break;
-    case PA_CONTEXT_TERMINATED:
-        av_log(ctx, AV_LOG_INFO, "PulseAudio connection terminated!\n");
-        break;
-    case PA_CONTEXT_READY:
-        av_log(ctx, AV_LOG_INFO, "PulseAudio connection ready!\n");
-        pa_operation_unref(pa_context_get_server_info(context,
-                           pulse_server_info_cb, ctx));
-        break;
-    }
-}
-
-static int init_pulse(struct capture_context *ctx)
-{
-    ctx->pa_mainloop = pa_threaded_mainloop_new();
-    ctx->pa_mainloop_api = pa_threaded_mainloop_get_api(ctx->pa_mainloop);
-
-    ctx->pa_context = pa_context_new(ctx->pa_mainloop_api, "dmabuf-capture");
-    pa_context_set_state_callback(ctx->pa_context, pulse_state_cb, ctx);
-    pa_context_connect(ctx->pa_context, NULL, PA_CONTEXT_NOAUTOSPAWN, NULL);
-
-    return 0;
-}
-
 static int init_swr(struct capture_context *ctx)
 {
     ctx->swr_ctx = swr_alloc();
@@ -1162,6 +905,7 @@ static int init_video_capture(struct capture_context *ctx)
 
     /* Start video encoding thread */
     pthread_create(&ctx->video_thread, NULL, video_encode_thread, ctx);
+    pthread_setname_np(ctx->video_thread, "video encoding");
 
     /* Start the frame callback */
     register_cb(ctx);
@@ -1173,18 +917,18 @@ static int init_audio_capture(struct capture_context *ctx)
 {
     int err;
 
-    if ((err = init_pulse(ctx)))
-        return err;
-
     if ((err = init_swr(ctx)))
         return err;
 
     if ((err = init_fifo(&ctx->audio_frames, ctx->audio_frame_queue)))
         return err;
 
+    /* Init pulse */
+    src_pulse.init(&ctx->audio_cap_ctx, &ctx->audio_frames);
+
     /* Start audio encoding and capture threads */
     pthread_create(&ctx->audio_thread, NULL, audio_encode_thread, ctx);
-    pa_threaded_mainloop_start(ctx->pa_mainloop);
+    pthread_setname_np(ctx->audio_thread, "audio encoding");
 
     return 0;
 }
@@ -1195,6 +939,7 @@ void on_quit_signal(int signo) {
 	printf("\r");
 	av_log(q_ctx, AV_LOG_WARNING, "Quitting!\n");
 	atomic_store(&q_ctx->quit, true);
+	src_pulse.stop(q_ctx->audio_cap_ctx);
 }
 
 static int main_loop(struct capture_context *ctx) {
@@ -1261,7 +1006,39 @@ static int init(struct capture_context *ctx)
     return 0;
 }
 
-static void uninit(struct capture_context *ctx);
+static void uninit(struct capture_context *ctx)
+{
+    struct wayland_output *output, *tmp_o;
+    wl_list_for_each_safe(output, tmp_o, &ctx->output_list, link)
+        remove_output(output);
+
+    if (ctx->export_manager)
+        zwlr_export_dmabuf_manager_v1_destroy(ctx->export_manager);
+
+    src_pulse.free(&q_ctx->audio_cap_ctx);
+
+    free_fifo(&ctx->video_frames);
+    free_fifo(&ctx->audio_frames);
+
+    av_buffer_unref(&ctx->drm_frames_ref);
+    av_buffer_unref(&ctx->drm_device_ref);
+    av_buffer_unref(&ctx->mapped_frames_ref);
+    av_buffer_unref(&ctx->mapped_device_ref);
+
+    av_dict_free(&ctx->video_encoder_opts);
+    av_dict_free(&ctx->audio_encoder_opts);
+
+    avcodec_free_context(&ctx->video_avctx);
+    avcodec_free_context(&ctx->audio_avctx);
+
+    swr_free(&ctx->swr_ctx);
+
+    if (ctx->avf)
+        avio_closep(&ctx->avf->pb);
+    avformat_free_context(ctx->avf);
+
+    wl_display_disconnect(ctx->display);
+}
 
 int main(int argc, char *argv[])
 {
@@ -1301,6 +1078,11 @@ int main(int argc, char *argv[])
     ctx.out_format = NULL;
     ctx.target_output = o->output;
 
+    if (!strncmp(ctx.out_filename, "rtmp", 4))
+        ctx.out_format = "flv";
+    if (!strncmp(ctx.out_filename, "udp", 3))
+        ctx.out_format = "mpegts";
+
     ctx.video_encoder = argv[4];
     ctx.video_bitrate = strtof(argv[6], NULL);
     ctx.video_sw_format = av_get_pix_fmt(argv[5]);
@@ -1325,44 +1107,4 @@ int main(int argc, char *argv[])
 end:
 	uninit(&ctx);
 	return err;
-}
-
-static void uninit(struct capture_context *ctx)
-{
-    struct wayland_output *output, *tmp_o;
-    wl_list_for_each_safe(output, tmp_o, &ctx->output_list, link)
-        remove_output(output);
-
-    if (ctx->export_manager)
-        zwlr_export_dmabuf_manager_v1_destroy(ctx->export_manager);
-
-    if (ctx->pa_mainloop) {
-        pa_threaded_mainloop_stop(ctx->pa_mainloop);
-        pa_threaded_mainloop_free(ctx->pa_mainloop);
-    }
-
-    if (ctx->pa_context)
-        pa_context_unref(ctx->pa_context);
-
-    free_fifo(&ctx->video_frames);
-    free_fifo(&ctx->audio_frames);
-
-    av_buffer_unref(&ctx->drm_frames_ref);
-    av_buffer_unref(&ctx->drm_device_ref);
-    av_buffer_unref(&ctx->mapped_frames_ref);
-    av_buffer_unref(&ctx->mapped_device_ref);
-
-    av_dict_free(&ctx->video_encoder_opts);
-    av_dict_free(&ctx->audio_encoder_opts);
-
-    avcodec_free_context(&ctx->video_avctx);
-    avcodec_free_context(&ctx->audio_avctx);
-
-    swr_free(&ctx->swr_ctx);
-
-    if (ctx->avf)
-        avio_closep(&ctx->avf->pb);
-    avformat_free_context(ctx->avf);
-
-    wl_display_disconnect(ctx->display);
 }

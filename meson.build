@@ -1,6 +1,6 @@
 project('wlstream', 'c',
     license: 'LGPL2.1+',
-    default_options: [ 'buildtype=debugoptimized', 'c_std=c99'],
+    default_options: [ 'buildtype=debugoptimized', 'c_std=gnu11'],
 )
 
 cc = meson.get_compiler('c')
