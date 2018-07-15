@@ -798,7 +798,7 @@ void *audio_encode_thread(void *arg)
         out_f->format = ctx->audio_avctx->sample_fmt;
         out_f->sample_rate = ctx->audio_avctx->sample_rate;
         out_f->channel_layout = ctx->audio_avctx->channel_layout;
-        out_f->pts = conv_audio_pts(ctx, first_pts);
+        out_f->pts = conv_audio_pts(ctx, in_f ? in_f->pts : INT64_MIN);
 
         os = swr_get_out_samples(ctx->swr_ctx, 0);
         if (in_f || (os > ctx->audio_avctx->frame_size)) {
