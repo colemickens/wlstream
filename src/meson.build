@@ -4,6 +4,7 @@ executable(
     install: true,
     dependencies: [wayland_client,
                    wlstream_protos,
+                   libdrm,
                    libavutil,
                    libavcodec,
                    libpulse,

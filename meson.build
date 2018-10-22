@@ -14,6 +14,7 @@ wayland_client    = dependency('wayland-client')
 wayland_protocols = dependency('wayland-protocols', version: '>=1.14')
 
 #Library deps
+libdrm        = dependency('libdrm')
 libavutil     = dependency('libavutil')
 libavcodec    = dependency('libavcodec')
 libavformat   = dependency('libavformat')
